@@ -1,178 +1,230 @@
 
 #include "dircache.h"
 
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cstring>
+#include <atomic>
+#include <time.h>
+#include <pthread.h>
 
-struct dircontext_t
-{
-	DIR* m_dir;
-	std::vector<dirent> m_entries;
-	size_t m_pos;
+/**
+ * Common threading utils
+ * RW Lock based on posix rwmutex
+ * & Auto lock helpers
+ */
+
+struct ReadWriteLock {
+	ReadWriteLock() {
+		pthread_rwlockattr_init(&attr);
+		pthread_rwlock_init(&lock, &attr);
+	}
+	ReadWriteLock(const ReadWriteLock&) = delete;
+	ReadWriteLock(ReadWriteLock&&) = delete;
+	
+	~ReadWriteLock() {
+		pthread_rwlock_destroy(&lock);
+		pthread_rwlockattr_destroy(&attr);
+	}
+	
+	void read_lock() {
+		pthread_rwlock_rdlock(&lock);
+	}
+	
+	void write_lock() {
+		pthread_rwlock_wrlock(&lock);
+	}
+	
+	void unlock() {
+		pthread_rwlock_unlock(&lock);
+	}
+	
+	pthread_rwlockattr_t attr;
+	pthread_rwlock_t lock;
 };
 
-std::unordered_map<std::string, dircontext_t*> gDirMap;
-
-// Kill off all internal cached data
-void dircache_invalidate()
-{
-	for(auto& pair : gDirMap)
-	{
-		auto* dir = pair.second;
-		if(dir->m_dir)
-		{
-			closedir(dir->m_dir);
-			dir->m_dir = nullptr;
-		}
-		
-		delete dir;
+struct AutoReadLock {
+	AutoReadLock(ReadWriteLock& lock) : lock_(lock) {
+		lock_.read_lock();
 	}
-	gDirMap.clear();
+	~AutoReadLock() {
+		lock_.unlock();
+	}
+	
+	ReadWriteLock& lock_;
+};
+
+struct AutoWriteLock {
+	AutoWriteLock(ReadWriteLock& lock) : lock_(lock) {
+		lock_.write_lock();
+	}
+	~AutoWriteLock() {
+		lock_.unlock();
+	}
+	
+	ReadWriteLock& lock_;
+};
+
+/**
+ * dirent_t represents a directory entry on the disk
+ * These have a vector of entries, an atomic ref count 
+ * and an addedat field for the time in which it was added
+ * Entries that are considered stale (configured by the user)
+ * will be purged from the db and replaced with fresh entries.
+ */
+struct dirent_t {
+	std::vector<dirent> entries;	// List of entries
+	std::atomic_uint32_t nref;		// Ref count from dirdbcontext-s
+	time_t addedat;					// When this entry was added to the db
+};
+
+/**
+ * dircontext_t just contains a position in the read stream
+ * and a pointer to the dirent_t that we're supposed to be 
+ * reading from.
+ * This is the definition of the details behind the 
+ */
+struct dircontext_t {
+	size_t pos;
+	dirent_t* ent;
+};
+
+// Returns the internal directory db
+static auto& dir_db() {
+	static std::unordered_map<std::string, dirent_t*> dirdb;
+	return dirdb;
+}
+
+static auto& dir_db_lock() {
+	static ReadWriteLock lock;
+	return lock;
+}
+
+static dircontext_t* dc_build_around_ent(dirent_t* dent) {
+	auto* ctx = new dircontext_t;
+	dent->nref.fetch_add(1); // Inc ref count
+	ctx->ent = dent;
+	ctx->pos = 0;
+	return ctx;
+}
+
+/**
+ * Find or populate the dir in the db
+ * Calls readdir outright if the dir doesn't exist in the db yet,
+ * then stores off those results.
+ */
+static dircontext_t* dc_find_or_populate(const char* path) {
+	auto db = dir_db();
+	if (auto ent = db.find(path); ent != db.end()) {
+		return dc_build_around_ent(ent->second);
+	}
+	
+	// Open the dir using standard POSIX functions,
+	// read contents and store into the db.
+	auto* d = opendir(path);
+	if (!d)
+		return nullptr;
+	dirent** namelist = nullptr;
+	// Grab all dir entries
+	int r = scandir(path, &namelist, 
+		[](const dirent* d) -> int { return 1; },
+		[](const dirent** a, const dirent** b) -> int {
+			return strcmp((*a)->d_name, (*b)->d_name);
+		});
+	// Bail out on error
+	if (r == -1) {
+		return nullptr;
+	}
+	
+	// Build a new directory entry
+	auto* dent = new dirent_t;
+	time(&dent->addedat);
+	dent->nref.store(0);
+	for (int i = 0; i < r; ++i)
+		dent->entries.push_back(*namelist[i]);
+	
+	// Insert into the db
+	dir_db_lock().write_lock();
+	dir_db().insert({path, dent});
+	dir_db_lock().unlock();
+	
+	// Finally build a returnable value
+	return dc_build_around_ent(dent);
+}
+
+static void dc_close(dircontext_t* context) {
+	context->ent->nref.fetch_sub(1); // Dec refcount
+	memset(context, 0, sizeof(*context)); // For safety :)
+	
+	// @TODO: Evict stale entries
+	
+	delete context;
+}
+
+void dircache_invalidate() {
+	dir_db_lock().write_lock();
+	dir_db().clear();
+	dir_db_lock().unlock();
 }
 
 // readdir(3)
-dirent* dircache_readdir(dircontext_t* dir)
-{
-	// Grab from internal list if it already exists
-	if(!dir->m_entries.empty())
-	{
-		if(dir->m_entries.size() <= dir->m_pos)
-			return nullptr;
-		return &dir->m_entries[dir->m_pos++];
-	}
-	
-	// Otherwise build the directory entry list and re-run ourselves 
-	dirent* dent = nullptr;
-	while((dent = readdir(dir->m_dir)))
-	{
-		dir->m_entries.push_back(*dent);
-	}
-	
-	// Break out early if there still aren't any entries!
-	if(dir->m_entries.empty())
+dirent* dircache_readdir(dircontext_t* dir) {
+	if (dir->pos >= dir->ent->entries.size())
 		return nullptr;
-	
-	return dircache_readdir(dir);
+	return &dir->ent->entries[dir->pos++];
 }
 
 // opendir(3)
-dircontext_t* dircache_opendir(const char* path)
-{
-	auto it = gDirMap.find(path);
-	
-	// Create new entry if not found 
-	if(it == gDirMap.end())
-	{
-		auto* dtree = new dircontext_t();
-		dtree->m_dir = opendir(path);
-		if(!dtree->m_dir)
-		{
-			delete dtree;
-			return nullptr;
-		}
-		gDirMap.insert({path, dtree});
-		return dtree;
-	}
-	
-	// Check if the directory is open or not, open if not
-	if(!it->second->m_dir)
-	{
-		it->second->m_dir = opendir(path);
-	}
-	
-	return it->second;
+dircontext_t* dircache_opendir(const char* path) {
+	return dc_find_or_populate(path);
 }
 
 // rewinddir(3)
-void dircache_rewinddir(dircontext_t* dir)
-{
-	dir->m_pos = 0;
-	rewinddir(dir->m_dir);
+void dircache_rewinddir(dircontext_t* dir) {
+	dir->pos = 0;
 }
 
 // telldir(3)
-long dircache_telldir(dircontext_t* dir)
-{
-	return telldir(dir->m_dir);
+long dircache_telldir(dircontext_t* dir) {
+	return dir->pos;
 }
 
 // seekdir(3)
-void dircache_seekdir(dircontext_t* dir, long loc)
-{
-	seekdir(dir->m_dir, loc);
-	dir->m_pos = loc;
+void dircache_seekdir(dircontext_t* dir, long loc) {
+	if (loc >= dir->ent->entries.size())
+		return;
+	dir->pos = loc;
 }
 
 // closedir(3)
-void dircache_closedir(dircontext_t* dir)
-{
-	closedir(dir->m_dir);
-	dir->m_dir = nullptr;
+void dircache_closedir(dircontext_t* dir) {
+	dc_close(dir);
 }
 
 // scandir(3)
-int dircache_scandir(const char* dirp, struct dirent*** namelist,
-	int(*filter)(const struct dirent*), 
-	int(*compare)(const struct dirent**, const struct dirent**))
-{
-	// Lookup the dir first
-	auto it = gDirMap.find(dirp);
+int dircache_scandir(const char* dirp,
+	struct dirent*** namelist,
+	int (*filter)(const struct dirent*),
+	int (*compare)(const struct dirent**,
+		const struct dirent**)) {
 	
-	auto populateItems = [=](dircontext_t* dir) -> int {
-		int num = scandir(dirp, namelist, filter, compare);
-		if(num < 0)
-			return num;
-		
-		for(int i = 0; i < num; i++) 
-		{
-			// TODO: This will affect readdir's ordering. readdir shouldn't have a defined order right?
-			dir->m_entries.push_back(*(*namelist)[i]);
-		}	
-		return num;
-	};
-	
-	if(it != gDirMap.end())
-	{
-		auto* dir = it->second;
-		// If the list is already populated, just return that
-		if(!dir->m_entries.empty())
-		{
-			const auto sz = dir->m_entries.size() * sizeof(dirent**);
-			*namelist = static_cast<dirent**>(calloc(1, sizeof(dirent*) * dir->m_entries.size()));
-			
-			size_t idx = 0;
-			for(auto& ent : dir->m_entries) 
-			{
-				if(filter && !filter(&ent))
-					continue;
-				(*namelist)[idx++] = &ent;
-			}
-			
-			// Sort using qsort, as specified in the manpages
-			if(compare)
-				qsort(*namelist, idx, sizeof(dirent*), (comparison_fn_t)compare);
-			
-			return idx;
-		}
-		// Otherwise populate the list and cache the result for subsequent calls
-		else
-		{
-			return populateItems(dir);
-		}
-	}
-	
-	// Create a new entry if not found yet, and populate it
-	auto* dir = new dircontext_t();
-	dir->m_dir = opendir(dirp);
-	
-	if(!dir->m_dir)
-	{
-		delete dir;
+	auto ctx = dc_find_or_populate(dirp);
+	if (!ctx)
 		return -1;
+		
+	// Accumulate entries into a list -- This is not quite optimal. Should determine the number of ents first
+	*namelist = (dirent**)calloc(ctx->ent->entries.size(), sizeof(dirent*));
+	int n = 0;
+	for (auto& e : ctx->ent->entries) {
+		if (filter && filter(&e))
+			continue;
+		(*namelist)[n++] = &e;
 	}
 	
-	gDirMap.insert({dirp, dir});
-	return populateItems(dir);
+	// Resultant list sorted with qsort, as specified by POSIX standard
+	if (n && compare)
+		qsort(*namelist, n, sizeof(dirent*), (comparison_fn_t)compare);
+	
+	return n;
 }
