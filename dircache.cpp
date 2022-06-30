@@ -1,6 +1,3 @@
-
-#include "dircache.h"
-
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -9,11 +6,42 @@
 #include <time.h>
 #include <pthread.h>
 
+#include "dircache.h"
+
+////////////////////////////////////////////////////////////////////////////////
+// Struct decls
+////////////////////////////////////////////////////////////////////////////////
+
 /**
- * Common threading utils
- * RW Lock based on posix rwmutex
- * & Auto lock helpers
+ * dirent_t represents a directory entry on the disk
+ * These have a vector of entries, an atomic ref count 
+ * and an addedat field for the time in which it was added
+ * Entries that are considered stale (configured by the user)
+ * will be purged from the db and replaced with fresh entries.
+ * Stale entries only get purged when their refcount reaches 0
+ * Thus, it's important to dirclose 
  */
+struct dirent_t {
+	std::vector<dirent> entries;	// List of entries
+	std::atomic_uint32_t nref;		// Ref count from dirdbcontext-s
+	double addedat;					// When this entry was added to the db
+};
+
+/**
+ * dircontext_t just contains a position in the read stream
+ * and a pointer to the dirent_t that we're supposed to be 
+ * reading from.
+ * This is the definition of the details behind the 
+ */
+struct dircontext_t {
+	size_t pos;
+	dirent_t* ent;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// Common threading utils and hash helpers
+//  RW lock is based on the posix rwmutex, also autolock helpers
+////////////////////////////////////////////////////////////////////////////////
 
 struct ReadWriteLock {
 	ReadWriteLock() {
@@ -44,6 +72,9 @@ struct ReadWriteLock {
 	pthread_rwlock_t lock;
 };
 
+/**
+ * Auto lock for reads on a RW mutex
+ */
 struct AutoReadLock {
 	AutoReadLock(ReadWriteLock& lock) : lock_(lock) {
 		lock_.read_lock();
@@ -55,6 +86,9 @@ struct AutoReadLock {
 	ReadWriteLock& lock_;
 };
 
+/**
+ * Auto lock for writes on a RW mutex
+ */
 struct AutoWriteLock {
 	AutoWriteLock(ReadWriteLock& lock) : lock_(lock) {
 		lock_.write_lock();
@@ -66,29 +100,9 @@ struct AutoWriteLock {
 	ReadWriteLock& lock_;
 };
 
-/**
- * dirent_t represents a directory entry on the disk
- * These have a vector of entries, an atomic ref count 
- * and an addedat field for the time in which it was added
- * Entries that are considered stale (configured by the user)
- * will be purged from the db and replaced with fresh entries.
- */
-struct dirent_t {
-	std::vector<dirent> entries;	// List of entries
-	std::atomic_uint32_t nref;		// Ref count from dirdbcontext-s
-	time_t addedat;					// When this entry was added to the db
-};
-
-/**
- * dircontext_t just contains a position in the read stream
- * and a pointer to the dirent_t that we're supposed to be 
- * reading from.
- * This is the definition of the details behind the 
- */
-struct dircontext_t {
-	size_t pos;
-	dirent_t* ent;
-};
+////////////////////////////////////////////////////////////////////////////////
+// Global db accessors
+////////////////////////////////////////////////////////////////////////////////
 
 // Returns the internal directory db
 static auto& dir_db() {
@@ -96,6 +110,7 @@ static auto& dir_db() {
 	return dirdb;
 }
 
+// Returns global db lock
 static auto& dir_db_lock() {
 	static ReadWriteLock lock;
 	return lock;
@@ -109,13 +124,26 @@ static dircontext_t* dc_build_around_ent(dirent_t* dent) {
 	return ctx;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Private helpers
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Returns time in ms
+ */
+static double dc_get_time() {
+	timespec tp;
+	clock_gettime(CLOCK_MONOTONIC, &tp);
+	return (tp.tv_sec * 1e3) + (tp.tv_nsec / 1e6);
+}
+
 /**
  * Find or populate the dir in the db
  * Calls readdir outright if the dir doesn't exist in the db yet,
  * then stores off those results.
  */
 static dircontext_t* dc_find_or_populate(const char* path) {
-	auto db = dir_db();
+	auto& db = dir_db();
 	if (auto ent = db.find(path); ent != db.end()) {
 		return dc_build_around_ent(ent->second);
 	}
@@ -139,7 +167,7 @@ static dircontext_t* dc_find_or_populate(const char* path) {
 	
 	// Build a new directory entry
 	auto* dent = new dirent_t;
-	time(&dent->addedat);
+	dent->addedat = dc_get_time();
 	dent->nref.store(0);
 	for (int i = 0; i < r; ++i)
 		dent->entries.push_back(*namelist[i]);
@@ -159,9 +187,15 @@ static void dc_close(dircontext_t* context) {
 	
 	// @TODO: Evict stale entries
 	
+	
 	delete context;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Public implementation
+////////////////////////////////////////////////////////////////////////////////
+
+// Invalidate all entries
 void dircache_invalidate() {
 	dir_db_lock().write_lock();
 	dir_db().clear();
