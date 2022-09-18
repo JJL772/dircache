@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <unistd.h>
@@ -49,3 +48,4 @@ void dircache_closedir(dircontext_t* dir);
 int dircache_scandir(const char* dirp, struct dirent*** namelist,
 	int(*filter)(const struct dirent*), 
 	int(*compare)(const struct dirent**, const struct dirent**));
+

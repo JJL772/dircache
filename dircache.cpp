@@ -5,6 +5,7 @@
 #include <atomic>
 #include <time.h>
 #include <pthread.h>
+#include <dirent.h>
 
 #include "dircache.h"
 
@@ -86,20 +87,6 @@ struct AutoReadLock {
 	ReadWriteLock& lock_;
 };
 
-/**
- * Auto lock for writes on a RW mutex
- */
-struct AutoWriteLock {
-	AutoWriteLock(ReadWriteLock& lock) : lock_(lock) {
-		lock_.write_lock();
-	}
-	~AutoWriteLock() {
-		lock_.unlock();
-	}
-	
-	ReadWriteLock& lock_;
-};
-
 ////////////////////////////////////////////////////////////////////////////////
 // Global db accessors
 ////////////////////////////////////////////////////////////////////////////////
@@ -137,15 +124,29 @@ static double dc_get_time() {
 	return (tp.tv_sec * 1e3) + (tp.tv_nsec / 1e6);
 }
 
+template<size_t N>
+static void dc_fix_path(const char* path, char (&dest)[N]) {
+	strncpy(dest, path, N);
+	dest[N-1] = 0;
+	char* c = dest;
+	while(*c) { c++; }
+	// Chop off any / at the end of the line
+	while(*c && *c == '/') {*c = 0;}
+}
+
 /**
  * Find or populate the dir in the db
  * Calls readdir outright if the dir doesn't exist in the db yet,
  * then stores off those results.
  */
 static dircontext_t* dc_find_or_populate(const char* path) {
-	auto& db = dir_db();
-	if (auto ent = db.find(path); ent != db.end()) {
-		return dc_build_around_ent(ent->second);
+	// Try to get an entry
+	{
+		AutoReadLock readLock(dir_db_lock());
+		auto &db = dir_db();
+		if (auto ent = db.find((char*)path); ent != db.end()) {
+			return dc_build_around_ent(ent->second);
+		}
 	}
 	
 	// Open the dir using standard POSIX functions,
@@ -174,7 +175,7 @@ static dircontext_t* dc_find_or_populate(const char* path) {
 	
 	// Insert into the db
 	dir_db_lock().write_lock();
-	dir_db().insert({path, dent});
+	dir_db().insert({strdup(path), dent});
 	dir_db_lock().unlock();
 	
 	// Finally build a returnable value
@@ -211,7 +212,9 @@ dirent* dircache_readdir(dircontext_t* dir) {
 
 // opendir(3)
 dircontext_t* dircache_opendir(const char* path) {
-	return dc_find_or_populate(path);
+	char fixed[PATH_MAX]; // Correct any bad slashes
+	dc_fix_path(path, fixed);
+	return dc_find_or_populate(fixed);
 }
 
 // rewinddir(3)
