@@ -9,6 +9,9 @@
 
 #include "dircache.h"
 
+// Uncomment to enable drop-in functionality
+//#define DIRCACHE_DROPIN
+
 ////////////////////////////////////////////////////////////////////////////////
 // Struct decls
 ////////////////////////////////////////////////////////////////////////////////
@@ -149,11 +152,7 @@ static dircontext_t* dc_find_or_populate(const char* path) {
 		}
 	}
 	
-	// Open the dir using standard POSIX functions,
 	// read contents and store into the db.
-	auto* d = opendir(path);
-	if (!d)
-		return nullptr;
 	dirent** namelist = nullptr;
 	// Grab all dir entries
 	int r = scandir(path, &namelist, 
@@ -167,7 +166,7 @@ static dircontext_t* dc_find_or_populate(const char* path) {
 	}
 	
 	// Build a new directory entry
-	auto* dent = new dirent_t;
+	auto* dent = new dirent_t();
 	dent->addedat = dc_get_time();
 	dent->nref.store(0);
 	for (int i = 0; i < r; ++i)
@@ -175,9 +174,13 @@ static dircontext_t* dc_find_or_populate(const char* path) {
 	
 	// Insert into the db
 	dir_db_lock().write_lock();
-	dir_db().insert({strdup(path), dent});
+	dir_db().insert({path, dent});
 	dir_db_lock().unlock();
 	
+	for (int i = 0; i < r; ++i)
+		free(namelist[i]);
+	free(namelist);
+
 	// Finally build a returnable value
 	return dc_build_around_ent(dent);
 }
@@ -199,6 +202,9 @@ static void dc_close(dircontext_t* context) {
 // Invalidate all entries
 void dircache_invalidate() {
 	dir_db_lock().write_lock();
+	for (auto& p : dir_db()) {
+		delete p.second;
+	}
 	dir_db().clear();
 	dir_db_lock().unlock();
 }
@@ -256,12 +262,27 @@ int dircache_scandir(const char* dirp,
 	for (auto& e : ctx->ent->entries) {
 		if (filter && filter(&e))
 			continue;
+	#ifdef DIRCACHE_DROPIN
+		auto* p = malloc(sizeof(dirent));
+		memcpy(p, &e, sizeof(dirent));
+		(*namelist)[n++] = (dirent*)p;
+	#else
 		(*namelist)[n++] = &e;
+	#endif
 	}
 	
 	// Resultant list sorted with qsort, as specified by POSIX standard
 	if (n && compare)
 		qsort(*namelist, n, sizeof(dirent*), (comparison_fn_t)compare);
 	
+	dc_close(ctx);
 	return n;
+}
+
+void dircache_freelist(struct dirent** namelist, int n) {
+#ifdef DIRCACHE_DROPIN
+	for (int i = 0; i < n; ++i)
+		free(namelist[i]);
+#endif
+	free(namelist);
 }

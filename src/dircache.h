@@ -44,8 +44,14 @@ void dircache_closedir(dircontext_t* dir);
 
 /**
  * @brief See scandir(3)
+ * NOTE: the namelist should be freed by dircache_freelist!
+ * Entries in the list should not be individually freed unless DIRCACHE_DROPIN is defined!
  */
 int dircache_scandir(const char* dirp, struct dirent*** namelist,
 	int(*filter)(const struct dirent*), 
 	int(*compare)(const struct dirent**, const struct dirent**));
 
+/**
+ * @brief Helper to free entry list returned by dircache_scandir
+ */
+void dircache_freelist(struct dirent** namelist, int n);
